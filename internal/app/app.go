@@ -91,7 +91,8 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	log.Info("voice ready", "name", speaker.Name(), "provider", cfg.VoiceProvider)
 
-	textToWav := func(text string) (string, error) {
+	// Second string is the station callsign. This speaker still uses one voice.
+	textToWav := func(text, _ string) (string, error) {
 		if speaker == nil {
 			return "", fmt.Errorf("no speaker")
 		}
