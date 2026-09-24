@@ -343,10 +343,17 @@ func (a *App) radioReceiveLoop(ctx context.Context) {
 				a.mic.Deaf(8 * time.Second)
 			}
 			a.log.Info("SRS listen transcript", "pilot", call.Pilot, "freq", call.Frequency.String(), "text", call.Transcript)
-			if a.tower.HandleRadioCall(call) {
-				a.log.Info("tower handled SRS call", "pilot", call.Pilot, "transcript", call.Transcript)
-			}
-			fmt.Print("skycontrol> ")
+			go func(call radio.ReceivedCall) {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Printf("  radio handler crashed: %v\n", r)
+					}
+				}()
+				if a.tower.HandleRadioCall(call) {
+					a.log.Info("tower handled SRS call", "pilot", call.Pilot, "transcript", call.Transcript)
+				}
+				fmt.Print("skycontrol> ")
+			}(call)
 		}
 	}
 }
