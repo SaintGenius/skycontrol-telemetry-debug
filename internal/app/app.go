@@ -91,10 +91,15 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	log.Info("voice ready", "name", speaker.Name(), "provider", cfg.VoiceProvider)
 
-	// Second string is the station callsign. This speaker still uses one voice.
-	textToWav := func(text, _ string) (string, error) {
+	// Second string is the ElevenLabs voice id for that airfield. Empty = Adam.
+	textToWav := func(text, voiceID string) (string, error) {
 		if speaker == nil {
 			return "", fmt.Errorf("no speaker")
+		}
+		if as, ok := speaker.(interface {
+			SayTempFileAs(string, string) (string, error)
+		}); ok {
+			return as.SayTempFileAs(text, voiceID)
 		}
 		return speaker.SayTempFile(text)
 	}
@@ -109,6 +114,7 @@ func New(cfg *config.Config) (*App, error) {
 	}, cfg.SRSExternalAudio, textToWav)
 
 	tower := atc.NewTower(log, db, srs)
+	tower.SetVoices(cfg.ElevenLabsVoices)
 	wind := weather.NewReader(log, weather.Config{
 		File:    cfg.WindFile,
 		From:    cfg.WindFrom,
@@ -174,14 +180,35 @@ func New(cfg *config.Config) (*App, error) {
 	var atisRadio radio.Client
 	var atisSvc *atc.ATIS
 	if _, isStub := srs.(*radio.StubClient); !isStub {
+		// ATIS is a tape loop. Always Piper so it never bills ElevenLabs.
+		atisVoice := speaker
+		if piper, err := voice.New(voice.Config{
+			Provider: "piper",
+			Voice:    cfg.VoiceName,
+			Speed:    cfg.VoiceSpeed,
+			ModelDir: "data/voices",
+			Log:      log,
+		}); err != nil || piper == nil {
+			log.Warn("piper ATIS missing, ATIS will use ATC voice", "error", err)
+			fmt.Println("  ATIS voice: same as ATC (Piper not found)")
+		} else {
+			atisVoice = piper
+			fmt.Println("  ATIS voice: piper (loop, no ElevenLabs)")
+		}
+		atisToWav := func(text, _ string) (string, error) {
+			if atisVoice == nil {
+				return "", fmt.Errorf("no ATIS voice")
+			}
+			return atisVoice.SayTempFile(text)
+		}
 		atisRadio = radio.NewNativeClient(radio.Config{
 			Address:     cfg.SRSAddress,
 			ClientName:  "Information",
 			EAMPassword: cfg.SRSPassword,
 			Coalition:   cfg.SRSCoalition,
 			Log:         log,
-		}, textToWav)
-		atisSvc = atc.NewATIS(log, tower, atisRadio, speaker)
+		}, atisToWav)
+		atisSvc = atc.NewATIS(log, tower, atisRadio, atisVoice)
 	}
 
 	var listen *radio.NativeClient
