@@ -98,6 +98,7 @@ type Tower struct {
 	speakFn func(string)
 	agent   *Agent
 	wind    *weather.Reader
+	voices  map[string]string
 
 	started           time.Time
 	lastCenterRelease time.Time
@@ -132,6 +133,81 @@ func (t *Tower) SetWind(w *weather.Reader) {
 	t.wind = w
 }
 
+func (t *Tower) SetVoices(m map[string]string) {
+	t.voices = configNormalizeVoices(m)
+	n := len(t.voices)
+	if n > 0 {
+		fmt.Printf("  field voices: %d (Ground/Tower share)\n", n)
+		for _, name := range []string{"senaki", "batumi", "kutaisi", "nellis"} {
+			if _, ok := t.voices[name]; ok {
+				fmt.Printf("    %s: yes\n", name)
+			} else {
+				fmt.Printf("    %s: MISSING\n", name)
+			}
+		}
+	} else {
+		fmt.Println("  field voices: 0 — all fields use default Adam. Check data/elevenlabs-voices.yaml")
+	}
+}
+
+func configNormalizeVoices(m map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, id := range m {
+		k = strings.ToLower(strings.TrimSpace(k))
+		k = strings.TrimSuffix(k, " tower")
+		k = strings.TrimSuffix(k, " ground")
+		k = strings.TrimSuffix(k, " approach")
+		id = strings.TrimSpace(id)
+		if k != "" && id != "" {
+			out[k] = id
+		}
+	}
+	return out
+}
+
+func (t *Tower) voiceID(af *airfield.Airfield) string {
+	if af == nil {
+		return ""
+	}
+	for _, n := range []string{af.Name, af.FullName, af.ID, af.ICAO} {
+		if id := t.voiceIDNamed(n); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func (t *Tower) voiceIDNamed(name string) string {
+	if t == nil || len(t.voices) == 0 {
+		return ""
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	n = strings.TrimSuffix(n, " tower")
+	n = strings.TrimSuffix(n, " ground")
+	n = strings.TrimSuffix(n, " approach")
+	n = strings.TrimSuffix(n, " information")
+	if id, ok := t.voices[n]; ok {
+		return id
+	}
+	if i := strings.IndexAny(n, "-/"); i > 2 {
+		if id, ok := t.voices[n[:i]]; ok {
+			return id
+		}
+	}
+	best, bestLen := "", 0
+	for k, id := range t.voices {
+		if len(k) < 4 {
+			continue
+		}
+		if strings.Contains(n, k) || strings.Contains(k, n) {
+			if len(k) > bestLen {
+				best, bestLen = id, len(k)
+			}
+		}
+	}
+	return best
+}
+
 func (t *Tower) WindStatus() string {
 	if t == nil || t.wind == nil {
 		return "no wind reader"
@@ -164,7 +240,10 @@ func (t *Tower) activeSpoken(af *airfield.Airfield, st *AircraftState) string {
 
 // UpdateAircraft is called when telemetry provides a new/updated object.
 func (t *Tower) UpdateAircraft(obj *telemetry.Object) {
-	if obj == nil || !strings.Contains(obj.Type, "Air") {
+	if obj == nil {
+		return
+	}
+	if !strings.Contains(obj.Type, "Air") && !strings.Contains(obj.Type, "FixedWing") && !strings.Contains(obj.Type, "Rotor") {
 		return
 	}
 
@@ -263,6 +342,9 @@ func (t *Tower) HandleRadioCall(call radio.ReceivedCall) bool {
 	st := t.identifyCaller(call)
 	if st != nil {
 		t.bindGUID(call.GUID, st)
+		if right := radioCallsign(call.Pilot); right != "" {
+			st.Callsign = right
+		}
 		if st.Callsign != "" {
 			call.Pilot = st.Callsign
 		}
@@ -273,14 +355,24 @@ func (t *Tower) HandleRadioCall(call radio.ReceivedCall) bool {
 	t.mu.Unlock()
 
 	if st == nil && strings.TrimSpace(call.GUID) != "" {
-		fmt.Println("  (unknown caller — say callsign)")
-		if IsCenterFreq(call.Frequency) {
-			t.sayCenter("Station calling, say your callsign.")
-		} else {
-			t.say(call.Frequency, t.cfgCallsign(nil, RoleTower),
-				"Station calling, say your callsign.")
+		cs := heardCallsign(call)
+		if cs == "" {
+			fmt.Println("  (unknown caller — say callsign)")
+			if IsCenterFreq(call.Frequency) {
+				t.sayCenter("Station calling, say your callsign.")
+			} else {
+				t.say(call.Frequency, t.cfgCallsign(nil, RoleTower),
+					"Station calling, say your callsign.")
+			}
+			return true
 		}
-		return true
+		call.Pilot = cs
+		fmt.Printf("  callsign %s — not in Tacview yet, answering anyway\n", cs)
+		if names := t.trackedNames(); names != "" {
+			fmt.Printf("  tacview sees: %s\n", names)
+		} else {
+			fmt.Println("  tacview sees: nobody")
+		}
 	}
 
 	if t.handleCenterCall(call) {
@@ -1030,11 +1122,11 @@ func (t *Tower) handleRadioCheck(call radio.ReceivedCall) bool {
 	st, af, pilot := t.resolveCaller(call, true)
 	role := RoleTower
 	onGround := st == nil || st.OnGround
-	text := strings.ToLower(call.Transcript)
-	if af != nil && (onGround || containsAny(text, "ground")) {
+	low := strings.ToLower(call.Transcript)
+	if af != nil && (onGround || containsAny(low, "ground")) {
 		role = RoleGround
 	}
-	if containsAny(text, "tower") {
+	if containsAny(low, "tower") {
 		role = RoleTower
 	}
 	cs := t.cfgCallsign(af, role)
@@ -1201,9 +1293,17 @@ func (t *Tower) say(freq radio.Frequency, callsign, text string) {
 	tx := radio.Transmission{
 		Callsign:  callsign,
 		Text:      SpeakForRadio(text),
-		Spoken:    text,
+		Spoken:    SpeakForRadio(text),
 		Frequency: freq,
 		Coalition: 0,
+		VoiceID:   t.voiceIDNamed(callsign),
+	}
+	if tx.VoiceID == "" && t.mu.TryRLock() {
+		st := t.primaryLocked()
+		t.mu.RUnlock()
+		if st != nil {
+			tx.VoiceID = t.voiceID(ownerOrNearest(st))
+		}
 	}
 	if freq.Hz < 1_000_000 {
 		tx.ExtraFreqs = t.fieldFreqs()
@@ -1229,7 +1329,7 @@ func (t *Tower) sayTX(tx radio.Transmission, text string) {
 		fmt.Println("  (no speaker hooked)")
 		return
 	}
-	t.speakFn(text)
+	t.speakFn(SpeakForRadio(text))
 }
 
 func (t *Tower) fieldFreqs() []radio.Frequency {
@@ -1447,6 +1547,8 @@ func (t *Tower) resolveCaller(call radio.ReceivedCall, preferGround bool) (*Airc
 		if af == nil {
 			af = st.Nearest
 		}
+	} else if cs := heardCallsign(call); cs != "" {
+		pilot = cs
 	}
 	return st, af, pilot
 }
@@ -1520,11 +1622,17 @@ func (t *Tower) identifyCaller(call radio.ReceivedCall) *AircraftState {
 	}
 	name := strings.TrimSpace(call.Pilot)
 	if name != "" && !strings.EqualFold(name, "Pilot") {
-		if st := t.findByPilot(name); st != nil && liveAC(st) {
-			a := compactCS(st.Callsign)
-			b := compactCS(name)
-			if a != "" && b != "" && (a == b || strings.Contains(a, b) || strings.Contains(b, a)) {
-				return st
+		for _, part := range splitRadioName(name) {
+			if st := t.findByPilot(part); st != nil && liveAC(st) {
+				a := compactCS(st.Callsign)
+				b := compactCS(part)
+				pa := compactCS(st.Pilot)
+				if a != "" && b != "" && (a == b || strings.Contains(a, b) || strings.Contains(b, a)) {
+					return st
+				}
+				if pa != "" && b != "" && (pa == b || strings.Contains(pa, b) || strings.Contains(b, pa)) {
+					return st
+				}
 			}
 		}
 	}
@@ -1532,7 +1640,94 @@ func (t *Tower) identifyCaller(call radio.ReceivedCall) *AircraftState {
 	if guid == "" {
 		return t.primaryLocked()
 	}
+	if st := t.soleUnboundOtherLocked(); st != nil {
+		fmt.Printf("  binding %s to the other jet Tacview has (%s)\n", radioCallsign(call.Pilot), st.Callsign)
+		return st
+	}
 	return nil
+}
+
+func heardCallsign(call radio.ReceivedCall) string {
+	cs := radioCallsign(call.Pilot)
+	if cs == "" || strings.EqualFold(cs, "Pilot") || strings.EqualFold(cs, "Aircraft") {
+		return ""
+	}
+	return cs
+}
+
+// radioCallsign prefers the right side of "Player | Sabre 1-1".
+func radioCallsign(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if i := strings.LastIndex(name, "|"); i >= 0 {
+		if right := strings.TrimSpace(name[i+1:]); right != "" {
+			return right
+		}
+	}
+	return SpeakCallsign(name)
+}
+
+// splitRadioName breaks "Spaz619 | Sabre 1-1" into the full string, the callsign, then the player name.
+func splitRadioName(name string) []string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	out := []string{name}
+	if i := strings.LastIndex(name, "|"); i >= 0 {
+		right := strings.TrimSpace(name[i+1:])
+		left := strings.TrimSpace(name[:i])
+		if right != "" {
+			out = append(out, right)
+		}
+		if left != "" {
+			out = append(out, left)
+		}
+	}
+	return out
+}
+
+func (t *Tower) soleUnboundOtherLocked() *AircraftState {
+	primary := t.primaryLocked()
+	var only *AircraftState
+	n := 0
+	for _, st := range t.aircraft {
+		if st == nil || st == primary || !liveAC(st) || strings.HasPrefix(st.ID, "demo-") {
+			continue
+		}
+		if st.RadioGUID != "" {
+			continue
+		}
+		n++
+		only = st
+	}
+	if n == 1 {
+		return only
+	}
+	return nil
+}
+
+func (t *Tower) trackedNames() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var parts []string
+	for _, st := range t.aircraft {
+		if st == nil || strings.HasPrefix(st.ID, "demo-") || !liveAC(st) {
+			continue
+		}
+		cs := st.Callsign
+		if cs == "" {
+			cs = st.Pilot
+		}
+		if cs == "" {
+			cs = st.ID
+		}
+		parts = append(parts, cs)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 func (t *Tower) bindGUID(guid string, st *AircraftState) {
