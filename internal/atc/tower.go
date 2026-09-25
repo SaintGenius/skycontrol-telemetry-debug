@@ -342,7 +342,8 @@ func (t *Tower) HandleRadioCall(call radio.ReceivedCall) bool {
 	st := t.identifyCaller(call)
 	if st != nil {
 		t.bindGUID(call.GUID, st)
-		if right := radioCallsign(call.Pilot); right != "" {
+		// SRS often names the client "player". Do not replace the Tacview callsign with that.
+		if right := radioCallsign(call.Pilot); usableCallsign(right) {
 			st.Callsign = right
 		}
 		if st.Callsign != "" {
@@ -1649,10 +1650,22 @@ func (t *Tower) identifyCaller(call radio.ReceivedCall) *AircraftState {
 
 func heardCallsign(call radio.ReceivedCall) string {
 	cs := radioCallsign(call.Pilot)
-	if cs == "" || strings.EqualFold(cs, "Pilot") || strings.EqualFold(cs, "Aircraft") {
+	if !usableCallsign(cs) {
 		return ""
 	}
 	return cs
+}
+
+func usableCallsign(cs string) bool {
+	cs = strings.TrimSpace(cs)
+	if cs == "" {
+		return false
+	}
+	switch strings.ToLower(cs) {
+	case "player", "pilot", "aircraft", "unknown", "station", "station calling":
+		return false
+	}
+	return true
 }
 
 // radioCallsign prefers the right side of "Player | Sabre 1-1".
